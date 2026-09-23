@@ -1,0 +1,5 @@
+opencv-python
+numpy
+pytesseract
+pywin32
+windows-capture==2.0.1

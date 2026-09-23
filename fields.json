@@ -1,0 +1,32 @@
+{
+  "character_name": {
+    "type": "text"
+  },
+  "level": {
+    "type": "int"
+  },
+  "rank": {
+    "type": "int"
+  },
+  "power": {
+    "type": "int"
+  },
+  "hp": {
+    "type": "int"
+  },
+  "p_atk": {
+    "type": "int"
+  },
+  "m_atk": {
+    "type": "int"
+  },
+  "p_def": {
+    "type": "int"
+  },
+  "m_def": {
+    "type": "int"
+  },
+  "speed": {
+    "type": "int"
+  }
+}
