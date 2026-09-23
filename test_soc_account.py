@@ -12,14 +12,17 @@ import soc_scraper
 from soc_navigation import NavigationError, WindowInput, crop, estimate_scroll_shift, visible_slots
 
 
-def configuration():
+def configuration(kind="roster"):
     region = {"x": 0., "y": 0., "w": 1., "h": 1., "type": "text"}
     anchor = {"region": region, "template": [[0, 255], [255, 0]]}
-    return {"screen": {"width": 500, "height": 400, "capture_backend": soc_scraper.CAPTURE_BACKEND},
+    config = {"screen": {"width": 500, "height": 400, "capture_backend": soc_scraper.CAPTURE_BACKEND},
             "list_page": anchor, "details_page": anchor,
             "grid": {"viewport": region, "first_card": {"x": .05, "y": .05, "w": .35, "h": .2},
                      "row_pitch": .3, "column_pitch": .5, "columns": 2},
             "fields": {"name": region, "type": region}, "back": {"x": .03, "y": .03}}
+    if kind == "equipment":
+        config["details_mode"] = "inline"
+    return config
 
 
 class GuidedStartTests(unittest.TestCase):
@@ -63,7 +66,7 @@ class GuidedStartTests(unittest.TestCase):
         api = Mock(CAPTURE_BACKEND=soc_scraper.CAPTURE_BACKEND)
         api.find_window.return_value = (1, "SoC")
         args = SimpleNamespace(command="equipment", count=3, config="unused", title="SoC", output="unused")
-        with patch.object(account, "load_json", return_value={"equipment": configuration()}), \
+        with patch.object(account, "load_json", return_value={"equipment": configuration("equipment")}), \
                 patch.object(account, "guided_prompt", return_value=True), \
                 patch.object(account, "matches_page", return_value=False), \
                 patch.object(account, "retry_page", side_effect=[True, False]) as retry, \
@@ -198,7 +201,7 @@ class RecognitionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             account.validate_config(config, "roster", soc_scraper.CAPTURE_BACKEND)
 
-    def test_inline_details_require_target_card_selection_even_when_items_look_identical(self):
+    def test_inline_details_do_not_depend_on_selected_border(self):
         config = configuration()
         config["details_mode"] = "inline"
         config["selection_marker"] = {"x": 0, "y": 0, "w": .1, "h": 1,
@@ -208,10 +211,11 @@ class RecognitionTests(unittest.TestCase):
         scanner = account.Scanner(Mock(), 1, "equipment", config, Mock(), Mock())
         with patch.object(account, "matches_page", return_value=True):
             self.assertTrue(scanner.is_page(frame, "list_page"))
-            scanner.expected_selection = {"x": .225, "y": .15}
             self.assertTrue(scanner.is_page(frame, "details_page"))
-            scanner.expected_selection = {"x": .725, "y": .15}
-            self.assertFalse(scanner.is_page(frame, "details_page"))
+            # A bad legacy marker is deliberately ignored, even by validation.
+            config["selection_marker"]["x"] = -10
+            account.validate_config(config, "equipment", soc_scraper.CAPTURE_BACKEND)
+            self.assertTrue(scanner.is_page(frame, "details_page"))
 
     def test_inline_equipment_recovery_does_not_click_back(self):
         config = configuration()
@@ -232,10 +236,11 @@ class ScanLoopTests(unittest.TestCase):
 
     def scanner(self, kind, count, records):
         store = account.AccountStore(self.path, kind, count)
-        scanner = account.Scanner(Mock(), 1, kind, configuration(), store, Mock())
+        scanner = account.Scanner(Mock(), 1, kind, configuration(kind), store, Mock())
         frame = np.zeros((400, 500, 3), np.uint8)
         scanner.wait_for_list = Mock(return_value=frame)
         scanner.wait_for_character_details = Mock(return_value=frame)
+        scanner.wait_for_equipment_details = Mock(return_value=frame)
         scanner.recover_list = Mock(return_value=frame)
         scanner.read_character = Mock(side_effect=records)
         scanner.read_equipment = Mock(side_effect=records)

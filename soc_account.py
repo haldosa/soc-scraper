@@ -14,11 +14,14 @@ import cv2
 import numpy as np
 import pytesseract
 
+from soc_panels import effect_entries, panel_routes, parse_tarot_stats, read_block
+
 from soc_navigation import (NavigationError, WindowInput, center, crop, difference,
-                            estimate_scroll_shift, visible_slots)
+                            estimate_scroll_shift, visible_slots, grid_diagnostics, validate_grid,
+                            normalized_rectangle)
 
 
-PAGE_NAMES = {"roster": "Character List", "equipment": "Inventory"}
+PAGE_NAMES = {"roster": "Character List", "equipment": "Inventory → Gear"}
 TYPE_WORDS = {"weapon": ["weapon", "sword", "blade", "spear", "lance", "axe", "bow", "staff", "wand"],
               "trinket": ["trinket", "accessory"]}
 
@@ -80,7 +83,7 @@ def confirm_ready(message, input_fn=None):
 def guided_prompt(kind, calibration=False):
     page = PAGE_NAMES[kind]
     if calibration:
-        title = "Roster" if kind == "roster" else "Equipment"
+        title = "Roster" if kind == "roster" else kind.title()
         detail = " containing both weapons and trinkets" if kind == "equipment" else ""
         return confirm_ready(
             f"{title} calibration\n\nOpen Sword of Convallaria and navigate to the {page} page{detail}.\n"
@@ -127,7 +130,7 @@ def matches_page(frame, page):
 def heading_matches(text, kind):
     words = re.findall(r"[a-z]+", text.casefold())
     if kind == "equipment":
-        return bool(set(words) & {"equipment", "equipments", "gear"})
+        return bool(set(words) & {"inventory", "equipment", "equipments", "gear"})
     # The roster says Character List / My Characters; character DETAILS says
     # Characters. Accept merged words and small OCR errors, not that bare word.
     for length in (1, 2):
@@ -258,7 +261,7 @@ class AccountStore:
         self.run = {"id": uuid.uuid4().hex, "kind": kind, "requested": count,
                     "collected": 0, "status": "running", "started_at": now(), "errors": []}
         self.account.setdefault("scans", {})[kind] = self.run
-        self.equipment_started = False
+        self.inventory_started = False
 
     def save(self):
         self.account["updated_at"] = now()
@@ -276,11 +279,12 @@ class AccountStore:
         else:
             # A fresh top-of-list scan replaces this inventory snapshot, never appends it
             # to a prior run (which would fabricate duplicate physical copies).
-            if not self.equipment_started:
-                self.account["equipment"] = []
-                self.equipment_started = True
-            record["id"] = f"equipment_{len(self.account['equipment']) + 1:03d}"
-            self.account["equipment"].append(record)
+            collection = "equipment"
+            if not self.inventory_started:
+                self.account[collection] = []
+                self.inventory_started = True
+            record["id"] = f"{self.kind}_{len(self.account[collection]) + 1:03d}"
+            self.account[collection].append(record)
         self.run["collected"] += 1
         self.save()
 
@@ -300,7 +304,8 @@ class Scanner:
         self.config, self.store = config, store
         self.input = controller or WindowInput(hwnd)
         self.resolution = None
-        self.expected_selection = None
+        self.detail_before = None
+        self.last_panel_update = {}
 
     def capture(self):
         frame = self.api.capture_window(self.hwnd)
@@ -317,27 +322,18 @@ class Scanner:
     def is_page(self, frame, state):
         if not matches_page(frame, self.config[state]):
             return False
+        if (state == "list_page" and self.config.get("details_mode") == "inline"
+                and not matches_page(frame, self.config["details_page"])):
+            return False
         if (state == "list_page" and self.config.get("details_mode") != "inline"
                 and matches_page(frame, self.config["details_page"])):
             return False
-        if (state == "details_page" and self.config.get("details_mode") == "inline"
-                and self.expected_selection is not None):
-            marker = self.config["selection_marker"]
-            card = self.config["grid"]["first_card"]
-            point = self.expected_selection
-            region = {"x": point["x"] - card["w"] / 2 + marker["x"] * card["w"],
-                      "y": point["y"] - card["h"] / 2 + marker["y"] * card["h"],
-                      "w": marker["w"] * card["w"], "h": marker["h"] * card["h"]}
-            actual = cv2.resize(crop(frame, region), (24, 24), interpolation=cv2.INTER_AREA)
-            delta = float(np.mean(np.abs(actual.astype(float) - np.asarray(marker["pixels"])))) / 255
-            if delta > marker.get("tolerance", .06):
-                return False
         if state == "details_page" and any(matches_page(frame, route["page"])
-                                            for route in self.config.get("build_panels", {}).values()):
+                                            for route in panel_routes(self.config).values()):
             return False
         return True
 
-    def wait_for(self, state, settle=None):
+    def wait_for(self, state, settle=None, changed_from=None):
         deadline = time.monotonic() + self.config.get("timeout", 10)
         previous = None
         stable_since = None
@@ -346,6 +342,11 @@ class Scanner:
             if self.is_page(frame, state):
                 region = settle or self.config[state]["region"]
                 current = crop(frame, region)
+                if changed_from is not None and difference(changed_from, current) < 1.8:
+                    previous = None
+                    stable_since = None
+                    time.sleep(.15)
+                    continue
                 if previous is not None and difference(previous, current) < 1.8:
                     if stable_since is not None and time.monotonic() - stable_since >= .35:
                         return frame
@@ -361,6 +362,63 @@ class Scanner:
     def wait_for_character_details(self):
         return self.wait_for("details_page", self.config["fields"]["name"])
 
+    def wait_for_equipment_details(self):
+        return self.wait_for_detail_name_change(self.detail_before, self.config["details_page"],
+                                               self.config["fields"], allow_unchanged=True)
+
+    def wait_for_detail_name_change(self, before, page, fields, allow_unchanged=False):
+        """Poll name/content/marker changes, then require stable readable details.
+
+        Inventory copies may be visually identical. After the bounded timeout a
+        stable unchanged pane is retained with an explicit diagnostic, never
+        deduplicated by name. Sibling skills require an observed update.
+        """
+        timeout = self.config.get("detail_timeout", 5)
+        deadline = time.monotonic() + timeout
+        was_open = before is not None and matches_page(before, page)
+        previous_name = read_field(self.api, before, fields["name"])[0] if was_open else None
+        regions = [page["region"], *fields.values()]
+
+        def images(frame):
+            return [crop(frame, region).copy() for region in regions]
+
+        baseline = images(before) if was_open else None
+        previous, stable_since, last_readable = None, None, None
+        changed = not was_open
+        last_name = None
+        while time.monotonic() < deadline:
+            frame = self.capture()
+            if not matches_page(frame, page):
+                changed = True  # An actual panel/page transition was observed.
+                previous, stable_since, last_readable = None, None, None
+                time.sleep(.12)
+                continue
+            current = images(frame)
+            visual_change = baseline is not None and any(difference(a, b) >= 1.8 for a, b in zip(baseline, current))
+            changed = changed or visual_change
+            stable = previous is not None and all(difference(a, b) < 1.8 for a, b in zip(previous, current))
+            if not stable:
+                stable_since, last_readable = time.monotonic(), None
+            elif time.monotonic() - stable_since >= .35:
+                last_name, _ = read_field(self.api, frame, fields["name"])
+                if last_name:
+                    last_readable = frame
+                    name_changed = previous_name is not None and key(last_name) != key(previous_name)
+                    if changed or name_changed:
+                        self.last_panel_update = {"status": "updated", "previous_name": previous_name,
+                                                  "current_name": last_name}
+                        return frame
+                else:
+                    last_readable = None
+            previous = current
+            time.sleep(.12)
+        if allow_unchanged and last_readable is not None:
+            self.last_panel_update = {"status": "unchanged_after_timeout", "previous_name": previous_name,
+                                      "current_name": last_name,
+                                      "warning": "No visible update observed after click; possibly an identical copy or already-selected card."}
+            return last_readable
+        raise NavigationError("Timed out waiting for a readable updated detail panel. Entry not counted.")
+
     def wait_for_roster_page(self):
         return self.wait_for("list_page", self.config["grid"]["viewport"])
 
@@ -370,22 +428,34 @@ class Scanner:
     def wait_for_list(self):
         return self.wait_for_roster_page() if self.kind == "roster" else self.wait_for_equipment_page()
 
+    def overlay_visible(self, frame):
+        return any(matches_page(frame, route["page"]) for route in panel_routes(self.config).values())
+
+    def dismiss_overlay(self, frame):
+        if self.overlay_visible(frame):
+            self.input.click(self.config["overlay_dismiss"])
+            return self.wait_for_character_details()
+        if self.is_page(frame, "details_page"):
+            return frame
+        raise NavigationError("Cannot dismiss an unrecognized character page.")
+
     def read_popup(self, route):
-        if not self.is_page(self.capture(), "details_page"):
-            raise NavigationError("Character details disappeared before opening a build panel.")
+        current = self.capture()
+        if not self.is_page(current, "details_page") and not self.overlay_visible(current):
+            raise NavigationError("Character page/overlay could not be verified before the next selection.")
         self.input.click(route["open"])
-        temporary_state = "active_popup"
-        self.config[temporary_state] = route["page"]
-        try:
-            frame = self.wait_for(temporary_state, route["fields"]["name"])
-            values, diagnostics = {}, {}
-            for field, spec in route["fields"].items():
-                values[field], diagnostics[field] = read_field(self.api, frame, spec)
-            self.input.click(route["close"])
-            self.wait_for_character_details()
-            return values, diagnostics
-        finally:
-            self.config.pop(temporary_state, None)
+        frame = self.wait_for_detail_name_change(current, route["page"], route["fields"])
+        if route.get("panel_kind") == "tarot":
+            record = self.read_tarot(frame, route["fields"])
+            return record, record["ocr"]
+        values, diagnostics = {}, {"panel_update": dict(self.last_panel_update)}
+        for field, spec in route["fields"].items():
+            reader = read_block if field == "engraving_stats" else read_field
+            try:
+                values[field], diagnostics[field] = reader(self.api, frame, spec)
+            except (RuntimeError, ValueError, cv2.error) as error:
+                values[field], diagnostics[field] = None, {"raw": "", "confidence": 0., "status": "error", "error": str(error)}
+        return values, diagnostics
 
     def read_character(self, frame):
         fields = self.config["fields"]
@@ -398,13 +468,16 @@ class Scanner:
         if not name or not any(character.isalpha() for character in name):
             raise ValueError("Character name could not be identified confidently.")
         record = {"name": name, "rank": values.get("rank"), "stars": read_stars(frame, self.config.get("stars")),
-                  "equipped": {"weapon": None, "trinket": None},
+                  "equipped": {"weapon": None, "trinket": None, "tarot": None}, "tarot": None,
                   "engravings": {"weapon": None, "trinket": None}, "skills": [],
                   "level": values.get("level"), "power": values.get("power"),
                   "ocr": diagnostics, "warnings": [], "captured_at": now()}
         record["stats"], record["ocr"]["stats"] = self.api.read_combat_stats(frame, self.config.get("stats", {}))
-        for slot in ("weapon", "trinket", "skill_1", "skill_2", "skill_3"):
-            route = self.config.get("build_panels", {}).get(slot)
+        panels = panel_routes(self.config)
+        skills = sorted((slot for slot in panels if re.fullmatch(r"skill_[1-9][0-9]*", slot)),
+                        key=lambda slot: int(slot.split("_")[1])) or ["skill_1", "skill_2", "skill_3"]
+        for slot in ["weapon", "trinket", *skills, "tarot"]:
+            route = panels.get(slot)
             if not route:
                 record["warnings"].append(f"{slot}: not calibrated")
                 continue
@@ -414,22 +487,46 @@ class Scanner:
                 if slot in ("weapon", "trinket"):
                     record["equipped"][slot] = values.get("name")
                     record["engravings"][slot] = values.get("engraving")
+                    record.setdefault("engraving_stats", {})[slot] = values.get("engraving_stats")
+                elif slot == "tarot":
+                    # This is the equipped slot of the character just identified,
+                    # so ownership comes from that context, not portrait recognition.
+                    values["equipped_by"] = name
+                    detail["equipped_by"] = {"value": name, "method": "character_context",
+                                             "confidence": diagnostics["name"]["confidence"]}
+                    record["tarot"] = values
+                    record["equipped"]["tarot"] = values.get("name")
                 elif values.get("name"):
                     record["skills"].append(values["name"])
             except (RuntimeError, ValueError, cv2.error) as error:
                 record["warnings"].append(f"{slot}: {error}")
-                # Return only using a close point when that exact panel is recognized.
+                # An OCR failure is not a reason to close a recognized sibling
+                # overlay. Keep inspecting directly; stop only on unknown state.
                 try:
                     current = self.capture()
-                    if matches_page(current, route["page"]):
-                        self.input.click(route["close"])
-                        self.wait_for_character_details()
-                    elif not self.is_page(current, "details_page"):
+                    if not self.overlay_visible(current) and not self.is_page(current, "details_page"):
                         raise NavigationError("Page state unknown after build-panel failure.")
                 except (RuntimeError, ValueError, cv2.error) as recovery_error:
                     record["warnings"].append(f"Remaining panels skipped: {recovery_error}")
                     break
         return record
+
+    def read_tarot(self, frame, fields):
+        values, diagnostics = {}, {"panel_update": dict(self.last_panel_update)}
+        for field in ("name", "level"):
+            try:
+                values[field], diagnostics[field] = read_field(self.api, frame, fields.get(field))
+            except (RuntimeError, ValueError, cv2.error) as error:
+                values[field], diagnostics[field] = None, {"raw": "", "confidence": 0., "status": "error", "error": str(error)}
+        if not values["name"] or not any(c.isalpha() for c in str(values["name"])):
+            raise ValueError("Tarot name could not be identified confidently.")
+        for field in ("main_stats", "details", "skill"):
+            values[field], diagnostics[field] = read_block(self.api, frame, fields.get(field))
+        stats, diagnostics["stats"] = parse_tarot_stats(
+            diagnostics["main_stats"], fields.get("main_stats", {}).get("min_confidence", 70))
+        return {"name": values["name"], "level": values["level"], "equipped_by": None,
+                "stats": stats, "details": effect_entries(values["details"]), "skill": values["skill"],
+                "ocr": diagnostics, "captured_at": now()}
 
     def read_equipment(self, frame):
         values, diagnostics = {}, {}
@@ -455,9 +552,11 @@ class Scanner:
 
     def recover_list(self):
         frame = self.capture()
+        if self.kind == "roster" and self.overlay_visible(frame):
+            frame = self.dismiss_overlay(frame)
         if self.is_page(frame, "list_page"):
             return self.wait_for_list()
-        if self.is_page(frame, "details_page"):
+        if self.kind == "roster" and self.is_page(frame, "details_page"):
             self.input.click(self.config["back"])
             return self.wait_for_list()
         raise NavigationError("Unknown page after entry failure. Stopped without blind back/click actions.")
@@ -471,7 +570,7 @@ class Scanner:
             while self.store.run["collected"] < count:
                 slots = list(visible_slots(self.config["grid"], offset))
                 if not slots:
-                    raise NavigationError("No fully visible grid slots. Check grid calibration.")
+                    raise NavigationError("No usable grid centers.\n" + grid_diagnostics(self.config["grid"], self.kind.title(), offset))
                 for position, point in slots:
                     if position in visited:
                         continue
@@ -480,10 +579,12 @@ class Scanner:
                     frame = self.wait_for_list()
                     before_entry = frame
                     try:
-                        self.expected_selection = point
+                        self.detail_before = before_entry
                         self.input.click(point)
-                        detail = self.wait_for_character_details()
+                        detail = self.wait_for_character_details() if self.kind == "roster" else self.wait_for_equipment_details()
                         record = self.read_character(detail) if self.kind == "roster" else self.read_equipment(detail)
+                        if self.kind != "roster":
+                            record.setdefault("ocr", {})["panel_update"] = dict(self.last_panel_update)
                         identity = key(record["name"])
                         if self.kind != "roster" or identity not in seen_characters:
                             record["source"] = {"scan_id": self.store.run["id"],
@@ -528,18 +629,15 @@ class Scanner:
 
 def validate_config(config, kind, backend):
     try:
-        def rectangle(region):
-            x, y, w, h = (float(region[k]) for k in ("x", "y", "w", "h"))
-            if not (0 <= x < 1 and 0 <= y < 1 and w > 0 and h > 0
-                    and x + w <= 1.001 and y + h <= 1.001):
-                raise ValueError("Rectangle outside the window")
+        def rectangle(region, path):
+            region.update(normalized_rectangle(region, f"{kind}.{path}"))
 
         def point(value):
             if not all(0 <= value[axis] <= 1 for axis in ("x", "y")):
                 raise ValueError("Input target outside the window")
 
-        def page(value):
-            rectangle(value["region"])
+        def page(value, path):
+            rectangle(value["region"], path + ".region")
             array = np.asarray(value["template"])
             if array.ndim != 2 or array.std() < 3 or not 0 < value.get("threshold", .88) <= 1:
                 raise ValueError("Invalid/blank page anchor")
@@ -549,56 +647,57 @@ def validate_config(config, kind, backend):
         if config["screen"]["width"] <= 0 or config["screen"]["height"] <= 0:
             raise ValueError("Invalid reference resolution")
         grid = config["grid"]
-        rectangle(grid["viewport"])
-        rectangle(grid["first_card"])
-        if (not isinstance(grid["columns"], int) or grid["columns"] <= 0
-                or grid["row_pitch"] <= 0 or grid["row_pitch"] >= grid["viewport"]["h"]
-                or grid["column_pitch"] < 0):
-            raise ValueError("Invalid grid geometry")
-        slots = list(visible_slots(grid, 0))
-        if not slots or slots[0][0] != (0, 0):
-            raise ValueError("No fully visible first-row slots")
-        viewport = grid["viewport"]
-        for _, target in slots:
-            point(target)
-            half_width = grid["first_card"]["w"] / 2
-            if (target["x"] - half_width < viewport["x"] - .001
-                    or target["x"] + half_width > viewport["x"] + viewport["w"] + .001):
-                raise ValueError("Cards extend outside the list viewport")
+        rectangle(grid["viewport"], "grid.viewport")
+        rectangle(grid["first_card"], "grid.first_card")
+        validate_grid(grid)
         for state in ("list_page", "details_page"):
-            page(config[state])
+            page(config[state], state)
         for field in (["name", "type"] if kind == "equipment" else ["name"]):
             if field not in config["fields"]:
                 raise ValueError(f"Missing {field} region")
-        for region in config["fields"].values():
-            rectangle(region)
-        for region in config.get("stats", {}).values():
-            rectangle(region)
-        for route in config.get("build_panels", {}).values():
+        for field, region in config["fields"].items():
+            rectangle(region, "fields." + field)
+        for field, region in config.get("stats", {}).items():
+            rectangle(region, "stats." + field)
+        for group, panel in config.get("character_details", {}).items():
+            page(panel["detail_marker"], f"character_details.{group}.detail_marker")
+            for field, region in panel.items():
+                if field != "detail_marker":
+                    rectangle(region, f"character_details.{group}.{field}")
+        for slot, route in panel_routes(config).items():
             point(route["open"])
-            point(route["close"])
-            page(route["page"])
+            if "character_details" not in config:
+                page(route["page"], f"build_panels.{slot}.page")
             if not route["fields"].get("name"):
                 raise ValueError("Build panel is missing its name region")
-            for region in route["fields"].values():
-                rectangle(region)
+            if "character_details" not in config:
+                for field, region in route["fields"].items():
+                    rectangle(region, f"build_panels.{slot}.fields.{field}")
+        if panel_routes(config):
+            if "overlay_dismiss" not in config:
+                raise ValueError("Calibrate ONE generic overlay_dismiss point; legacy per-panel close points are not used")
+            point(config["overlay_dismiss"])
         if config.get("stars"):
-            for slot in config["stars"]["slots"]:
-                rectangle(slot)
+            for index, slot in enumerate(config["stars"]["slots"]):
+                rectangle(slot, f"stars.slots[{index}]")
         if not (-120 <= config.get("scroll_delta", -120) < 0):
             raise ValueError("scroll_delta must be between -120 and -1")
         if not 1 <= config.get("timeout", 10) <= 60:
             raise ValueError("timeout must be between 1 and 60 seconds")
-        if config.get("details_mode") == "inline":
-            if kind != "equipment":
-                raise ValueError("Inline details are supported for the Equipment page")
-            rectangle(config["selection_marker"])
-            if np.asarray(config["selection_marker"]["pixels"]).shape != (24, 24, 3):
-                raise ValueError("Missing selected-card border sample")
+        if not 1 <= config.get("detail_timeout", 5) <= 60:
+            raise ValueError("detail_timeout must be between 1 and 60 seconds")
+        if kind == "equipment":
+            if config.get("details_mode") != "inline":
+                raise ValueError(f"{kind.title()} requires the persistent inline details pane; run calibrate-{kind}")
         else:
             point(config["back"])
     except (KeyError, TypeError, ValueError) as error:
-        raise RuntimeError(f"Invalid {kind} calibration: {error}. Run calibrate-{kind}.") from error
+        report = ""
+        try:
+            report = "\n" + grid_diagnostics(config["grid"], kind.title())
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            pass
+        raise RuntimeError(f"Invalid {kind} calibration: {error}.{report}\nReason rejected: {error}. Run calibrate-{kind}.") from error
 
 
 def scan_account(args, api):
@@ -619,8 +718,8 @@ def scan_account(args, api):
             hwnd, _ = api.find_window(args.title)
             frame = api.capture_window(hwnd)
             valid = (matches_page(frame, config["list_page"])
-                     and (config.get("details_mode") == "inline"
-                          or not matches_page(frame, config["details_page"])))
+                     and (matches_page(frame, config["details_page"]) if config.get("details_mode") == "inline"
+                          else not matches_page(frame, config["details_page"])))
         except RuntimeError as error:
             print(error)
             valid = False
@@ -629,7 +728,7 @@ def scan_account(args, api):
         if not retry_page(kind):
             return
     print("Found Sword of Convallaria window.")
-    print("Starting character scan..." if kind == "roster" else "Starting equipment scan...")
+    print("Starting character scan..." if kind == "roster" else f"Starting {kind} scan...")
     store = AccountStore(args.output, kind, args.count)
     Scanner(api, hwnd, kind, config, store).run(args.count)
     print(f"Saved {store.run['collected']}/{args.count} entries to {args.output} ({store.run['status']}).")

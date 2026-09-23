@@ -1,14 +1,16 @@
 # Sword of Convallaria account scanner
 
 A Windows-only, external UI scanner that exports visible character builds and owned
-equipment to JSON for review and AI recommendations. It extends the original
+equipment and Tarot Whispers to JSON for review and AI recommendations. It extends the original
 single-character scraper; `windows`, `calibrate`, `scrape`, and `watch` still work.
 
 **Weapons and trinkets are scanned together from the same Equipment page** —
 Inventory → Gear in the English UI. There are no separate weapon/trinket workflows.
 
-The scanner deliberately does **not** collect Tarots, currencies, or upgrade
-resources. It does not change builds, equip items, enhance gear, or spend resources.
+Each character's **equipped Tarot Whisper** is read from its slot on the character
+details page during `roster`, using separate popup regions calibrated in
+`calibrate-roster`. The scanner does **not** scan the Tarot inventory, currencies,
+or upgrade resources. It does not change builds, equip items, enhance gear, or spend resources.
 
 ## What it collects
 
@@ -17,14 +19,17 @@ resources. It does not change builds, equip items, enhance gear, or spend resour
 | Name, rank, stars | Name, weapon/trinket category |
 | Equipped weapon and trinket names | Item level, stars/dupe level |
 | Weapon/trinket engraving types | Equipped status and visible owner name |
-| Up to three equipped skill names | Separate entries for separate physical copies |
+| Configurable number of equipped skill names | Separate entries for separate physical copies |
 | Level and power | Scan position and generated copy ID |
 | Final displayed HP, P.ATK, M.ATK, P.DEF, M.DEF, Speed | |
 
 Fields require reliable text or calibrated visual samples. Unknown values are
 `null`; an empty skills array means no skill names were read, not necessarily that
 no skills are equipped. OCR diagnostics and warnings are included. A portrait alone
-does not identify a character name. Engraving types are collected, not all rolls.
+does not identify a character name. Shared gear calibration can also capture visible
+engraving bonus text. Equipped Tarot data includes name, level, owning character, main stats,
+rolled effects, and skill text. Only visible/calibrated content is collected;
+off-screen or clipped descriptions are not reconstructed.
 
 This exports recommendation input; it is not a built-in build optimizer or game
 knowledge database. Unlocked but unequipped skills, team synergy, and item effects
@@ -58,11 +63,14 @@ location, add its directory to PATH. Installing `pytesseract` alone does not ins
 the OCR engine.
 
 The calibration bootstrap recognizes the English **Character List** / **My Characters**
-headings and the Equipment/Gear label. It isolates the header, tries enlarged and
+headings and Inventory/Gear labels. It isolates the header, tries enlarged and
 thresholded OCR, and accepts merged `MyCharacters` text or small OCR spelling errors.
 The bare **Characters** heading belongs to character details and is not accepted
 as the roster. Failed calibration checks print the heading OCR for troubleshooting.
 Other UI languages need adjusted bootstrap labels and Tesseract language settings.
+Inventory bootstrap is a plausibility check following your guided page selection.
+Calibrated scans check a stable inventory heading/count label and the corresponding
+details-pane marker; they do not depend on selected-tab highlights or card borders.
 
 ## First-time calibration
 
@@ -81,8 +89,9 @@ a rectangle and press ENTER or Space. **C** skips optional selections. Required
 selections offer retry/cancel. Previews are scaled to fit your display; saved
 coordinates are normalized to the original HWND frame, including its title bar.
 
-Both calibrations are stored in `scanner_regions.json`, under separate `roster`
-and `equipment` sections. The original `regions.json` is unchanged. Cancellation
+Calibrations are stored in `scanner_regions.json`, under separate `roster` and
+`equipment` sections. Equipped Tarot geometry belongs to the roster configuration.
+The original `regions.json` is unchanged. Cancellation
 or an invalid calibration preserves the previous scanner configuration.
 
 ### Roster calibration
@@ -91,9 +100,14 @@ or an invalid calibration preserves the previous scanner configuration.
 2. Select the **Character List** heading, including both words, or a stable
    list-only control such as the sort label. Do not select the character-details
    heading **Characters**.
-3. Select the scrollable card area, excluding controls and scrollbar. Enter its
-   column count; select the first card, last card in row one, and first card in
-   row two. Include each card's full bounds consistently.
+3. Select only the scrollable character-card viewport: start below the **Character
+   List** header and end above **Power / Compact Mode / Ranking**. Exclude the
+   fixed bottom controls and scrollbar. Enter the visible column count (**5** in
+   the reference layout); select the first card, last card in row one, and first
+   card in row two consistently. Their centers establish the grid. Small decorative
+   overhangs outside the viewport are allowed; pixel-perfect containment is not
+   required. The wizard prints slot diagnostics and offers a retry immediately
+   if the geometry is invalid, before continuing the rest of calibration.
 4. Open the first character. Select a distinct details-page anchor and its Back
    target. Reuse existing name/rank/level/power regions or select new ones. Crop
    numeric values tightly, excluding labels and decorative icons.
@@ -102,44 +116,123 @@ or an invalid calibration preserves the previous scanner configuration.
 5. Optionally calibrate stars: select each slot and identify filled and empty
    references. A missing reference can be supplied from another character in the
    same layout. Both types are required; otherwise stars remain null.
-6. For each equipped weapon, trinket, and skill slot, select its information target
-   on the character frame. Open the panel manually; select its stable anchor,
-   name, and Close/Back target. **Do not select Equip, Replace, Enhance, Upgrade,
-   or another action that changes the account.** Optional panels can be skipped.
-7. For gear panels, select visible engraving **type** text or its icon. For an
-   icon, supply its known label and optionally add other examples at the same
-   location. Unseen icon types remain null.
-8. Return to the roster and scroll to the top for the final page check.
+6. Select **one generic overlay-dismiss point** in a safe dead area on character
+   details. It must close information panels without changing gear/skills or
+   navigating back. The separate character-page **Back** target returns to the
+   Character List; it is not an overlay dismiss target.
+7. Enter the number of equipped skill icons to inspect. Equipped Tarot is included
+   in the wizard. Select each **click target** on the character frame once.
+   Then calibrate **one shared gear panel**: a stable marker, name, engraving type,
+   and optional engraving stats/bonus text. Weapon and trinket reuse those exact
+   regions. For the marker, select a shared frame feature or Skill heading,
+   not the changing Weapon/Trinket title. Icon-only engraving types can use labelled
+   visual samples; unseen types remain null.
+8. Calibrate **one shared skill panel**: marker and name. All equipped skill
+   targets read those same regions. Equipped Tarot gets its own marker,
+   name, level, main-stat table, additional details, and skill text.
+   Ownership comes from the character being scraped; no owner ROI is needed.
+   Its geometry is separate from both gear and skill panels.
+9. Dismiss the last overlay using the generic dead-area point, return to the
+   Character List, and scroll to the top for the final page check.
+
+Navigation is **weapon → trinket → skill 1 → skill 2 → …**, with direct clicks and
+no dismiss between selections. Equipped Tarot is inspected last. The
+single generic dismiss point is used only to close the remaining overlay before
+returning to the Character List. Choose exposed information targets, never
+Equip, Unequip, Replace, Refine, Enhance, Upgrade, or another action that changes
+the account.
+
+New roster calibration stores geometry once under `character_details.gear`,
+`character_details.skills`, and `character_details.tarot`; separate
+`build_targets` hold only click points. Each panel contains `detail_marker` and
+`name`; gear adds `engraving_type` / `engraving_stats`, and Tarot adds `level`,
+`main_stats`, `details`, and `skill` when calibrated. For example:
+
+```text
+roster
+  character_details
+    gear:   detail_marker, name, engraving_type, engraving_stats
+    skills: detail_marker, name
+    tarot:  detail_marker, name, level, main_stats, details, skill
+  build_targets: weapon, trinket, skill_1, skill_2, ..., tarot
+  overlay_dismiss: one point
+```
+
+Existing `build_panels` configurations remain readable, but run `calibrate-roster`
+to replace duplicated regions with the shared format. Legacy per-panel `close`
+and `dismiss_gear_before_skills` settings are ignored. A generic `overlay_dismiss`
+point is still required when build panels are configured.
 
 ### Equipment calibration — one inventory for both categories
 
 1. Open Inventory → Gear, containing **weapons and trinkets**, apply the normal
    filter/sort you want, and scroll to the top.
-2. Use the **selected Gear tab including its highlight** as the list anchor. This
-   distinguishes Gear from the neighboring Tarot, Material, and other tabs.
+2. Use a stable **Inventory heading** or **Gear:** count label as the list anchor.
+   Exclude changing count digits. There is no selected Gear highlight requirement.
 3. Calibrate the grid as above.
-4. The usual Equipment layout has a persistent details panel beside the grid.
-   Answer **Y** to the inline-details question. Select the first item, the details
-   anchor, and a small distinctive section of the first card's **selected border
-   or corner**, excluding artwork. The wizard checks that this does not also match
-   a neighboring unselected card. No Back click is used between equipment entries.
-5. If your layout opens a separate details page, answer **N** and calibrate its Back
-   target instead.
-6. Select the name, level, and optional stars/ownership fields. For type, select the
+4. Equipment uses the persistent **right-side details pane** beside the grid.
+   Select the first item and a stable gear-details marker. **Selected-card-border
+   calibration is no longer needed.** No Back click is used between equipment entries.
+   Each click updates this pane: **item 1 → read pane → item 2 → read pane → …**.
+   The scanner polls the previous/current name, detail marker, and panel content,
+   then waits for readable stable content before OCR.
+5. Select the name, level, and optional stars/ownership fields. For type, select the
    **equipment category label or icon**. Never use the item name, rarity, or engraving
    type: weapons and trinkets can share the same engraving type.
-7. Text categories such as Weapon, Sword, Bow, Staff, Trinket, and Accessory are
+6. Text categories such as Weapon, Sword, Bow, Staff, Trinket, and Accessory are
    classified automatically. For icon-only types, label examples `weapon` or
    `trinket`; include every different weapon-family icon you expect to scan.
    The same region must work for both categories. Unknown types are skipped and
    reported, rather than guessed from an item's name or artwork.
-8. Return to the Equipment list at the top for the final check.
+7. Leave Inventory → Gear at the top for the final check. Old calibrations using
+   a separate equipment details page must be replaced with `calibrate-equipment`.
+
+### Equipped Tarot calibration
+
+Run `python soc_scraper.py calibrate-roster` and follow its character-details
+steps. Select the equipped Tarot icon alongside weapon and trinket. When prompted,
+click that icon to open the **equipped Tarot popup on the character page**;
+stay on that character, without navigating to Inventory or selecting another copy.
+
+Select a Tarot-specific detail marker, name, and numeric level. For
+`main_stats`, select the **whole labelled table** containing P.ATK, M.ATK, P.DEF,
+M.DEF, and Max HP. This uses multiline OCR to associate numbers with their labels;
+unreadable/ambiguous rows become null independently. Select the additional rolled
+effects and skill description in their own text regions, including wrapped lines.
+Do not include buttons or neighboring gear stats. Names are required; optional
+unavailable fields can be skipped.
+
+Every character's equipped Tarot uses these same popup regions, independently of
+the shared weapon/trinket layout. A skipped Tarot target or unreadable Tarot name
+produces `tarot: null` and a warning; the rest of the character still saves.
 
 Optional configuration settings include `timeout` (10 seconds), `scroll_delta`
 (-120; reduce its magnitude if scrolling loses overlap), per-field `min_confidence`
 (50 on Tesseract's 0–100 scale), and `type_words` to override category labels.
 Page anchors and icon references are compact pixel arrays in calibration JSON,
 not exported screenshots.
+
+`detail_timeout` defaults to 5 seconds. A changed OCR name, changed detail content,
+or marker transition can confirm an update. Identical inventory copies (or the
+already-selected first card) may produce no visible change: after this timeout,
+a still-readable stable pane is retained with
+`ocr.panel_update.status: "unchanged_after_timeout"`. This preserves separate
+copies, but cannot distinguish a missed click from an identical panel; review
+those diagnostics. Unreadable panes and unchanged sibling skills time out as errors.
+
+Rectangle validation identifies the exact field path and prints x/y/w/h/right/bottom.
+Numeric roundoff up to `0.00001` is clamped to the window; substantial overflow,
+zero/negative sizes, and non-finite values are rejected. A valid grid cannot hide
+an invalid name, stat, marker, or other field region.
+
+Grid settings inside each calibration's `grid` object also include
+`center_margin` (0.003 of the window dimensions), `edge_tolerance` (0.008), and
+`min_visible_fraction` (0.65). A click center must stay inside the viewport with
+the safety margin; at least the configured fraction of the inferred card must
+overlap the viewport, allowing the small edge tolerance for decorations. These
+defaults apply to older grids too. They preserve row/column identities after
+scrolling and reject mostly hidden rows or centers over the bottom controls.
+Scrolling is directed at the center of the calibrated viewport.
 
 Recalibrate after changing window mode, UI scale, aspect ratio, grid, or panel
 layout. Normalized coordinates tolerate proportional resizing, not arbitrary layout
@@ -249,6 +342,23 @@ scroll overlap, never name or image deduplication.
 [3/30] Fancy Hat - trinket
 ```
 
+## Equipped Tarot in a character scan
+
+Use the normal character workflow:
+
+```powershell
+python soc_scraper.py calibrate-roster
+python soc_scraper.py roster --count 10
+```
+
+For each character, the scanner reads weapon/trinket and skill panels, clicks the
+equipped Tarot icon, reads its Tarot-specific popup, and dismisses the final
+overlay before returning to the Character List. Results are saved incrementally
+under `characters[].tarot`; `characters[].equipped.tarot` contains the name.
+`equipped_by` uses the current character's identified name, marked as
+`character_context` in diagnostics. Same-named Tarots on different characters
+remain attached to their respective character records.
+
 ## Counts, cancellation, and partial results
 
 Any positive integer is accepted:
@@ -265,8 +375,9 @@ Zero/negative counts produce `Error: --count must be greater than 0.`
 Each successful entry is saved immediately with atomic file replacement. **Ctrl+C
 preserves collected data.** Failed entries are recorded in the scan's `errors` and
 skipped when the list can be recovered safely. Optional panel failures produce
-warnings/nulls where possible. Unknown pages, lost focus, ambiguous scroll overlap,
-and unverified selections stop the scan without blind clicks.
+warnings/nulls where possible. Unknown pages, lost focus, and ambiguous scroll overlap
+stop the scan without blind recovery clicks. Unchanged-but-readable inventory
+panes follow the duplicate-copy policy described above and retain a warning.
 
 Two verified no-movement scrolls mark `end_of_list`. Fewer entries than requested
 can indicate an exhausted list, unrecognized entries, or a navigation problem;
@@ -274,14 +385,14 @@ inspect status and errors. `complete` means the requested count was reached,
 **not** that the whole account was scanned.
 
 Restart from the top; there is no automatic mid-list resume. Roster runs update
-matching characters and retain others from earlier runs. Equipment runs replace
-the prior inventory snapshot **on the first successful entry**, preventing a rerun
+matching characters and retain others from earlier runs, including their equipped
+Tarot data. Equipment runs replace their inventory snapshot **on the first successful entry**, preventing a rerun
 from doubling owned copies. An interrupted run retains its partial snapshot and
-status. A run with zero successful items leaves the previous equipment snapshot intact.
+status. A run with zero successful items leaves its previous snapshot intact.
 
 ## Generated JSON
 
-Both commands update `soc_account.json`. Use the same custom output for both to
+Both commands update `soc_account.json`. Use the same custom output to
 combine their results:
 
 ```powershell
@@ -300,7 +411,15 @@ Abbreviated illustrative output, not a claim about your account:
       "rank": 11,
       "stars": 3,
       "stats": {"hp": 6421, "p_atk": 1842, "m_atk": 957, "p_def": 811, "m_def": 704, "speed": 162},
-      "equipped": {"weapon": "Weapon A", "trinket": "Trinket B"},
+      "equipped": {"weapon": "Weapon A", "trinket": "Trinket B", "tarot": "Dream of The Magician"},
+      "tarot": {
+        "name": "Dream of The Magician",
+        "level": 60,
+        "equipped_by": "SP Inanna",
+        "stats": {"p_atk": 230, "m_atk": 230, "p_def": 86, "m_def": 86, "max_hp": 551},
+        "details": ["Increases [P.ATK] by 77", "Increases [P.ATK] by 10.0%", "Increases [P.ATK] by 8.0%"],
+        "skill": "Increases DMG by 8%. When casting skills, for each additional enemy hit, the DMG is increased by 4%, up to 16%."
+      },
       "engravings": {"weapon": "Cup", "trinket": null},
       "skills": ["Skill A", "Skill B", "Skill C"],
       "level": 55,
@@ -335,6 +454,14 @@ Actual output adds timestamps, raw OCR/confidence, grid positions and scan IDs,
 warnings, and `scans` metadata. Equipment IDs belong to an inventory snapshot;
 they are not permanent game IDs.
 
+Tarot records keep the complete visible text that OCR can read, including a fourth
+replacement-skill effect when present. The example abbreviates those effects.
+`ocr.main_stats`, `ocr.stats`, `ocr.details`, and `ocr.skill` retain raw text and
+confidence; missing stats/skill are null and unreadable effect blocks yield
+an empty details array with diagnostics. The data belongs to the character record;
+no Tarot inventory snapshot or copy IDs are generated. Previously saved extra
+JSON sections are preserved rather than deleted.
+
 `equipped: null` means unknown, unlike verified `false`. A null owner does not prove
 an item is free. Reconciliation links a physical copy only when name, type, and
 visible owner identify one copy. A unique visible inventory owner can fill a
@@ -364,11 +491,15 @@ priority; ambiguous matches report candidates. New scanner commands also accept
 | Symptom | Action |
 | --- | --- |
 | Expected page not detected | Use Character List for roster calibration, not character details. Read the heading OCR diagnostic; check language/anchors. After updating the script, stop the old process and restart it to load the fix. Q cancels. |
-| Calibration missing | Run the matching `calibrate-roster` or `calibrate-equipment` command. |
-| Details mistaken for list | Select distinct anchors; use inline mode for the side-by-side Equipment layout. |
-| Identical copies fail selection | Recalibrate a distinctive selected border without artwork. |
+| Calibration missing | Run `calibrate-roster` for character builds, including equipped Tarot, or `calibrate-equipment` for Gear inventory. |
+| Details mistaken for list | Select distinct Character List/details anchors. Gear inventory uses a stable heading/count label and a corresponding detail-pane marker. |
+| Invalid rectangle | Read the named field and its x/y/w/h/right/bottom values. Tiny rounding overshoot is clamped; reselect genuinely misplaced regions. Legacy selected-border rectangles are ignored. |
+| No fully visible first-row slots / invalid grid | Restart the updated script. First-row validation now uses safe centers and sufficient visible area rather than full-card containment. Read the printed viewport, columns, first-row Y, candidate centers, visibility fractions, and rejection reasons. Recalibrate misplaced centers/pitch; exclude the header and bottom controls from the viewport. |
+| Generic overlay-dismiss point missing | Run `calibrate-roster` to select one safe dead area. Per-panel close targets are no longer used. |
+| Identical copies / unchanged detail pane | No border matching is used. Check `ocr.panel_update`: a readable stable pane with no observable update is retained after `detail_timeout` with a warning. Check focus and click targets if repeated names look wrong. |
 | Type unknown/wrong | Select actual equipment category, not engraving; add missing category-icon samples. |
-| Stars/engravings/skills missing | Calibrate their slots/panels and reference icons. Unknown symbols stay null. |
+| Stars/engravings/skills missing | Calibrate star slots and the shared gear/skill panels. Unknown icons stay null. Use a gear marker common to both weapon and trinket. |
+| Tarot stats/details missing | Run `calibrate-roster` and select the equipped Tarot icon and popup regions on character details. Include labels AND numbers in its main-stat table, and visible effect/skill text in separate regions. |
 | Empty rank / extra power digits | Crop digits tightly, excluding labels and decorative icons. |
 | Combat stat is null | Check `ocr.stats` for raw text/confidence/status, then calibrate just the numeric total on the main Attributes panel. Old calibration files have no stat regions until selected. |
 | Owner unknown | Calibrate visible owner text if available; a portrait alone is insufficient. |
@@ -405,7 +536,8 @@ account output stays in local JSON files.
 
 `soc_scraper.py` retains capture/OCR/CLI; `soc_account.py` handles scans and saving;
 `soc_navigation.py` handles mouse input/scroll tracking; `soc_calibration.py` handles
-the interactive wizard.
+the interactive wizard; `soc_panels.py` resolves shared panel geometry and parses
+multiline Tarot/engraving text.
 
 ## Verification and current limits
 
@@ -418,6 +550,12 @@ duplicate copies across scroll overlap, unique characters, failed entries, Ctrl+
 atomic saving, reconciliation, classification, stars, and ambiguous scroll rejection.
 Stat tests also cover direct displayed totals, per-stat OCR failure/low confidence,
 strict parsing, calibration reuse, and nested stats/diagnostics in both output formats.
+Navigation regressions cover the five-column reference geometry with decorative
+overhang, unsafe/mostly hidden slots, stable row IDs after scrolling, direct sibling
+panel transitions, one final dismiss, stale skill text, and persistent inventory panes.
+Additional tests cover named rectangle failures and epsilon clamping, calibration
+without selected borders, shared gear/skill/Tarot regions, panel-update polling and
+timeouts, equipped Tarot parsing/ownership, and interrupted incremental character saving.
 
 HWND capture was previously verified with VS Code overlapping the game. The
 current Equipment/Gear page was inspected live and recognized by the calibration
@@ -431,8 +569,9 @@ count, compare JSON against the UI, then increase the count.
 Give the combined `soc_account.json` to your AI assistant:
 
 > Recommend the best builds and strongest teams using only these characters and
-> equipment. Respect separate copy IDs; never assign one physical item to two
+> equipment and equipped Tarot Whispers. Respect equipment copy IDs; never assign one physical item to two
 > characters simultaneously. Show gear conflicts, suggested engraving pairs, and
 > equipped-skill changes. Treat nulls as unknown, check scan coverage and OCR
 > warnings, and ask about missing ownership/unlocked skills instead of guessing.
-> Do not include Tarots or resource costs.
+> Include Tarot rolls/skill effects that were read, but do not infer missing effects
+> or resource costs.

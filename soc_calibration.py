@@ -5,7 +5,7 @@ import numpy as np
 
 from soc_account import (atomic_json, bootstrap_page, confirm_ready, guided_prompt,
                          load_json, matches_page, retry_page, template, validate_config)
-from soc_navigation import center, crop
+from soc_navigation import center, crop, grid_diagnostics, validate_grid
 
 
 class CalibrationCancelled(Exception):
@@ -122,6 +122,7 @@ def stars(api, hwnd, frame):
 
 def grid(frame):
     print("\nUse a uniform grid with at least two visible rows. Disable grouping if the game offers it.")
+    print("For Character List, start below the heading and end ABOVE Power/Compact Mode/Ranking controls.")
     viewport = select(frame, "Scrollable card area ONLY - exclude headings, sort controls and scrollbar")
     columns = number("Number of columns in this grid: ", 1)
     first = select(frame, "Entire FIRST card at top left (including its outer bounds)")
@@ -129,10 +130,9 @@ def grid(frame):
     second = select(frame, "Entire FIRST card in the SECOND row")
     row_pitch = center(second)["y"] - center(first)["y"]
     column_pitch = (center(last)["x"] - center(first)["x"]) / (columns - 1) if columns > 1 else 0
-    if row_pitch <= 0 or (columns > 1 and column_pitch <= 0):
-        raise RuntimeError("Cards must be selected left-to-right and top-to-bottom. Calibration not saved.")
     return {"viewport": viewport, "columns": columns, "first_card": first,
-            "row_pitch": row_pitch, "column_pitch": column_pitch}
+            "row_pitch": row_pitch, "column_pitch": column_pitch,
+            "center_margin": .003, "edge_tolerance": .008, "min_visible_fraction": .65}
 
 
 def add_icon_samples(api, hwnd, spec, frame, prompt, allowed=None):
@@ -152,31 +152,66 @@ def add_icon_samples(api, hwnd, spec, frame, prompt, allowed=None):
         frame = stage(api, hwnd, "In the game, show the next icon example using the same panel and location.")
 
 
+def tarot_fields(frame, fields=None):
+    fields = fields if fields is not None else {}
+    if "name" not in fields:
+        fields["name"] = select(frame, "Shared Tarot NAME", field_type="text")
+    for field, label, field_type in (
+        ("level", "Tarot LEVEL number only", "int"),
+        ("main_stats", "Tarot MAIN STATS table: labels AND values P.ATK, M.ATK, P.DEF, M.DEF, Max HP", "block"),
+        ("details", "Tarot additional rolled DETAILS / effects text, including wrapped lines", "block"),
+        ("skill", "Tarot SKILL description text only", "block"),
+    ):
+        if field not in fields:
+            region = optional_field(frame, label, field_type)
+            if region:
+                region["min_confidence"] = 70 if field == "main_stats" else 60
+                fields[field] = region
+    return fields
+
+
 def build_panels(api, hwnd, detail_frame, details_page):
-    routes = {}
-    for slot in ("weapon", "trinket", "skill_1", "skill_2", "skill_3"):
-        print(f"\nBuild panel: {slot}. Select only an equipped slot's information icon, never Equip/Upgrade/Replace.")
-        opening = select(detail_frame, f"Click target for {slot} on CHARACTER DETAILS", required=False)
-        if not opening:
+    targets, panels = {}, {}
+    skill_count = number("Number of equipped skill icons to inspect [3]: ", 3, minimum=0, maximum=10)
+    slots = ["weapon", "trinket", *(f"skill_{i + 1}" for i in range(skill_count)), "tarot"]
+    print("Select each click target once. Shared panel regions are calibrated only once per layout.")
+    for slot in slots:
+        opening = select(detail_frame, f"Click target for equipped {slot} (not Equip/Unequip/Upgrade)", required=False)
+        if opening:
+            targets[slot] = center(opening)
+    groups = (("gear", [s for s in ("weapon", "trinket") if s in targets]),
+              ("skills", [s for s in targets if s.startswith("skill_")]),
+              ("tarot", [s for s in targets if s == "tarot"]))
+    for group, selections in groups:
+        if not selections:
             continue
-        frame = stage(api, hwnd,
-                      f"Open that equipped {slot} information panel manually. Do not change the build.")
-        page = anchor(frame, f"Stable label UNIQUE to the {slot} panel (not the changing item/skill name)")
-        if matches_page(detail_frame, page):
-            raise RuntimeError(f"{slot} anchor also matches closed character details. Select a distinct popup label.")
-        fields = {"name": select(frame, f"{slot} NAME only", field_type="text")}
-        if slot in ("weapon", "trinket"):
-            engraving = optional_field(frame, f"{slot} engraving TYPE text or single engraving icon")
+        frame = stage(api, hwnd, f"Click {selections[0]} directly. Calibrate the shared {group} panel once.\n"
+                      "Other sibling icons remain clickable; do not change the build.")
+        marker_hint = ("a shared frame detail or Skill heading, NOT the changing Weapon/Trinket label"
+                       if group == "gear" else "a shared skill panel frame/heading" if group == "skills"
+                       else "Tarot Whisper / Tarot-specific panel structure")
+        marker = anchor(frame, f"Shared {group} detail marker: {marker_hint}")
+        if matches_page(detail_frame, marker):
+            raise RuntimeError(f"Shared {group} marker also matches the closed character page. Select a panel-only marker.")
+        panel = {"detail_marker": marker}
+        if group == "tarot":
+            tarot_fields(frame, panel)
+        else:
+            panel["name"] = select(frame, f"Shared {group} NAME (wide enough for longer names)", field_type="text")
+        if group == "gear":
+            engraving = optional_field(frame, "Shared gear engraving TYPE text or single type icon")
             if engraving:
-                add_icon_samples(api, hwnd, engraving, frame,
-                                 "If this is an icon instead of text, supply its known engraving type, e.g. Cup.")
-                fields["engraving"] = engraving
-        closing = select(frame, f"Close/back target for {slot} panel - returns to character details")
-        routes[slot] = {"open": center(opening), "close": center(closing), "page": page, "fields": fields}
-        returned = stage(api, hwnd, "Close the information panel and return to CHARACTER DETAILS.")
+                add_icon_samples(api, hwnd, engraving, frame, "For an icon, label its known engraving type, e.g. Cup.")
+                panel["engraving_type"] = engraving
+            rolls = optional_field(frame, "Shared gear engraving STATS / bonus text", "block")
+            if rolls:
+                panel["engraving_stats"] = rolls
+        panels[group] = panel
+    if panels:
+        returned = stage(api, hwnd, "Inspection complete. Click the ONE generic dead-area dismiss point to return to character details.")
         if not matches_page(returned, details_page):
-            raise RuntimeError("Character details anchor did not match after closing the panel. Calibration not saved.")
-    return routes
+            raise RuntimeError("Character details anchor did not match after the generic dismiss. Calibration not saved.")
+    return targets, panels
 
 
 def calibrate_scanner(args, api):
@@ -195,44 +230,32 @@ def calibrate_scanner(args, api):
                 return
         config = {"screen": {"width": frame.shape[1], "height": frame.shape[0],
                              "capture_backend": api.CAPTURE_BACKEND},
-                  "timeout": 10, "scroll_delta": -120}
+                  "timeout": 10, "detail_timeout": 5, "scroll_delta": -120}
         config["list_page"] = anchor(frame,
-            "SELECTED Gear/Equipment tab INCLUDING its highlight (must distinguish it from Tarot/Material tabs)"
+            "Inventory heading or Gear: count label (exclude the changing count; NO tab highlight)"
             if kind == "equipment" else
             "The Character List heading (include BOTH words) or a stable list-only sort control")
-        config["grid"] = grid(frame)
-        config["details_mode"] = "separate"
-        if kind == "equipment" and answer(
-                "Does selecting equipment update a details panel BESIDE the grid, without leaving it? [Y/n]: ", "y").casefold() == "y":
-            config["details_mode"] = "inline"
+        while True:
+            config["grid"] = grid(frame)
+            print(grid_diagnostics(config["grid"], kind.title()))
+            try:
+                validate_grid(config["grid"])
+                break
+            except ValueError as error:
+                print(f"Reason rejected: {error}")
+                if not confirm_ready("Press ENTER to reselect the grid before continuing calibration."):
+                    raise CalibrationCancelled()
+        config["details_mode"] = "inline" if kind != "roster" else "separate"
         detail = stage(api, hwnd,
                        "Open the FIRST character's details." if kind == "roster" else
-                       "Open the FIRST equipment item's details, showing its name and type. Weapons and trinkets use this same flow.")
+                       "Click the FIRST equipment card to update its persistent details pane. Stay on Inventory -> Gear.")
         config["details_page"] = anchor(detail,
-            "Stable label in the equipment DETAILS PANEL (not the changing item name)"
+            f"Stable {kind}-specific DETAILS PANEL label/layout (not the changing item name or selected border)"
             if config["details_mode"] == "inline" else
             "Stable DETAILS-ONLY label, absent from the list (e.g. Rank or equipment details label)")
         if config["details_mode"] != "inline" and matches_page(frame, config["details_page"]):
             raise RuntimeError("Details anchor also matches the list. Choose a label unique to details.")
-        if config["details_mode"] == "inline":
-            print("Select a small section of the FIRST card's SELECTED border/corner, excluding item artwork.")
-            marked = select(detail, "Selected FIRST card's distinctive border/corner")
-            card = config["grid"]["first_card"]
-            marker = {"x": (marked["x"] - card["x"]) / card["w"],
-                      "y": (marked["y"] - card["y"]) / card["h"],
-                      "w": marked["w"] / card["w"], "h": marked["h"] / card["h"],
-                      "pixels": visual_sample(detail, marked, "selected")["pixels"], "tolerance": .06}
-            # Check a neighboring unselected card to reject an ordinary, shared border.
-            neighbor = dict(marked)
-            if config["grid"]["columns"] > 1:
-                neighbor["x"] += config["grid"]["column_pitch"]
-            else:
-                neighbor["y"] += config["grid"]["row_pitch"]
-            alternative = np.asarray(visual_sample(detail, neighbor, "unselected")["pixels"])
-            if np.mean(np.abs(alternative.astype(float) - np.asarray(marker["pixels"]))) / 255 <= marker["tolerance"]:
-                raise RuntimeError("Selected marker also matches an unselected card. Choose a distinctive highlighted border.")
-            config["selection_marker"] = marker
-        else:
+        if kind == "roster":
             config["back"] = center(select(detail, "Back/close target returning from DETAILS to the LIST"))
         fields = {}
         existing = load_json("regions.json", {})
@@ -243,7 +266,7 @@ def calibrate_scanner(args, api):
                 if name in ("character_name", "rank", "level", "power"):
                     fields["name" if name == "character_name" else name] = dict(region)
         if "name" not in fields:
-            fields["name"] = select(detail, "Character NAME only" if kind == "roster" else "Equipment NAME only", field_type="text")
+            fields["name"] = select(detail, "Character NAME only" if kind == "roster" else f"{kind.title()} NAME only", field_type="text")
         for name in (("rank", "level", "power") if kind == "roster" else ("level",)):
             if name not in fields:
                 selected = optional_field(detail, name + " number ONLY", "int")
@@ -254,8 +277,11 @@ def calibrate_scanner(args, api):
             config["stats"] = stat_regions(api, detail, existing, reuse)
         config["stars"] = stars(api, hwnd, detail)
         if kind == "roster":
-            config["build_panels"] = build_panels(api, hwnd, detail, config["details_page"])
-        else:
+            config["overlay_dismiss"] = center(select(detail,
+                "ONE generic overlay-dismiss point: safe dead area, outside panels/icons/Back (not Unequip)"))
+            config["build_targets"], config["character_details"] = build_panels(
+                api, hwnd, detail, config["details_page"])
+        elif kind == "equipment":
             fields["type"] = select(detail,
                 "Weapon/trinket CATEGORY label or icon - NEVER the engraving type or item name", field_type="text")
             for field, label in (("equipped_status", "Equipped/Not Equipped status text"),
@@ -266,12 +292,13 @@ def calibrate_scanner(args, api):
             add_icon_samples(api, hwnd, fields["type"], detail,
                              "If type is icon-only, label a weapon and a trinket example; include each different weapon-family icon.",
                              allowed=("weapon", "trinket"))
-        final_frame = stage(api, hwnd, f"Return to the {'Characters' if kind == 'roster' else 'Equipment'} LIST and scroll to the top.")
+        final_frame = stage(api, hwnd, f"Return to the {'Character List' if kind == 'roster' else 'Inventory -> Gear'} and scroll to the top.")
         if (not matches_page(final_frame, config["list_page"])
                 or (config["details_mode"] != "inline" and matches_page(final_frame, config["details_page"]))):
             raise RuntimeError("List/details anchors are not distinct. Calibration not saved; select more specific labels.")
         validate_config(config, kind, api.CAPTURE_BACKEND)
-        saved = load_json(args.config, {"version": 1})
+        saved = load_json(args.config, {"version": 2})
+        saved["version"] = 2
         saved[kind] = config
         atomic_json(args.config, saved)
         print(f"Calibration saved to {args.config}. Original regions.json is unchanged.")

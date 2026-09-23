@@ -1,0 +1,24 @@
+{
+  "game": "Sword of Convallaria",
+  "characters": [],
+  "equipment": [],
+  "scans": {
+    "roster": {
+      "id": "693e4f4ae19943fab746e2165f657619",
+      "kind": "roster",
+      "requested": 21,
+      "collected": 0,
+      "status": "stopped",
+      "started_at": "2026-09-23T16:45:47.324636+02:00",
+      "errors": [
+        {
+          "position": null,
+          "message": "Windows did not foreground the game. Select it and retry.",
+          "at": "2026-09-23T16:45:47.325285+02:00"
+        }
+      ],
+      "finished_at": "2026-09-23T16:45:47.328686+02:00"
+    }
+  },
+  "updated_at": "2026-09-23T16:45:47.328742+02:00"
+}
